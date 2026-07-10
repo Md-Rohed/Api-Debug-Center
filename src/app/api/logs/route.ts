@@ -38,8 +38,8 @@ function resolveSessionId(request: NextRequest): string {
   const raw = request.nextUrl.searchParams.get("sessionId");
   if (!raw) return SHARED_INGEST_SESSION;
 
-  // Basic validation: only allow UUID-like values to avoid Redis key injection
-  const sanitized = raw.replace(/[^a-zA-Z0-9-_]/g, "");
+  // Allow UUID chars plus email-safe chars (letters, digits, -, _, ., @, +)
+  const sanitized = raw.replace(/[^a-zA-Z0-9-_.@+]/g, "");
   return sanitized.length > 0 ? sanitized : SHARED_INGEST_SESSION;
 }
 
@@ -58,14 +58,17 @@ export async function GET(request: NextRequest) {
   });
 }
 
-export async function POST(request: Request) {
+export async function POST(request: NextRequest) {
   if (!secretMatches(request.headers.get("x-erp-debug-secret"))) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   try {
     const payload = (await request.json()) as Partial<ApiDebugLogPayload>;
-    const log = await addApiDebugLog(payload, SHARED_INGEST_SESSION);
+    // Use the sessionId from the URL (set by ERP api-client via developer email).
+    // Falls back to SHARED_INGEST_SESSION when no sessionId is supplied.
+    const sessionId = resolveSessionId(request);
+    const log = await addApiDebugLog(payload, sessionId);
 
     return Response.json({ ok: true, logId: log.id });
   } catch {

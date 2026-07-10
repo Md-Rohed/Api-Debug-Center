@@ -9,6 +9,7 @@ import {
   RefreshCw,
   Server,
   Trash2,
+  User,
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -25,22 +26,21 @@ type LogsResponse = {
 
 const filters: ApiDebugStatusFilter[] = ["all", "success", "failed"];
 
-const SESSION_STORAGE_KEY = "erp-debug-session-id";
+const SESSION_STORAGE_KEY = "erp-debug-developer-email";
 
-/** Returns a stable session ID for this browser tab.
- *  A new UUID is generated on the very first visit and persisted in
- *  localStorage so refreshing the page keeps the same session. */
-function getOrCreateSessionId(): string {
+function readSavedEmail(): string {
   try {
-    const existing = localStorage.getItem(SESSION_STORAGE_KEY);
-    if (existing) return existing;
-
-    const fresh = crypto.randomUUID();
-    localStorage.setItem(SESSION_STORAGE_KEY, fresh);
-    return fresh;
+    return localStorage.getItem(SESSION_STORAGE_KEY) ?? "";
   } catch {
-    // Fallback if localStorage is unavailable (e.g. private browsing quirks)
-    return crypto.randomUUID();
+    return "";
+  }
+}
+
+function saveEmail(email: string) {
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, email);
+  } catch {
+    // Ignore
   }
 }
 
@@ -80,10 +80,13 @@ export function ApiDebugDashboard() {
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [storage, setStorage] = useState<LogsResponse["storage"]>("memory");
 
-  // Stable session ID — created once on mount, never changes during the tab lifetime
-  const sessionIdRef = useRef<string | null>(null);
+  // Developer email — used as the per-developer sessionId.
+  // Populated from localStorage on first render.
+  const [developerEmail, setDeveloperEmail] = useState("");
+  const emailInputRef = useRef<HTMLInputElement>(null);
+
   useEffect(() => {
-    sessionIdRef.current = getOrCreateSessionId();
+    setDeveloperEmail(readSavedEmail());
   }, []);
 
   const selectedLog = logs.find((log) => log.id === selectedLogId) ?? logs[0] ?? null;
@@ -105,11 +108,14 @@ export function ApiDebugDashboard() {
   }, [logs]);
 
   const loadLogs = useCallback(async () => {
-    const sessionId = sessionIdRef.current;
-    if (!sessionId) return;
+    if (!developerEmail.trim()) {
+      setLoading(false);
+      return;
+    }
 
     try {
       setError(null);
+      const sessionId = encodeURIComponent(developerEmail.trim());
       const response = await fetch(
         `/api/logs?status=${filter}&sessionId=${sessionId}`,
         { cache: "no-store" },
@@ -132,7 +138,7 @@ export function ApiDebugDashboard() {
     } finally {
       setLoading(false);
     }
-  }, [filter]);
+  }, [filter, developerEmail]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -153,13 +159,22 @@ export function ApiDebugDashboard() {
   }, [autoRefresh, loadLogs]);
 
   async function clearLogs() {
-    const sessionId = sessionIdRef.current;
-    if (!sessionId) return;
+    if (!developerEmail.trim()) return;
 
+    const sessionId = encodeURIComponent(developerEmail.trim());
     await fetch(`/api/logs?sessionId=${sessionId}`, { method: "DELETE" });
     setLogs([]);
     setSelectedLogId(null);
     setLastUpdated(new Date().toISOString());
+  }
+
+  function handleEmailChange(value: string) {
+    setDeveloperEmail(value);
+    saveEmail(value);
+    // Reset log state so the new session loads cleanly
+    setLogs([]);
+    setSelectedLogId(null);
+    setLoading(true);
   }
 
   return (
@@ -173,6 +188,18 @@ export function ApiDebugDashboard() {
           <h1>ERP API Debug Center</h1>
         </div>
         <div className="debug-actions">
+          <div className="developer-identity">
+            <User size={15} aria-hidden="true" />
+            <input
+              ref={emailInputRef}
+              type="email"
+              placeholder="Your ERP login email…"
+              value={developerEmail}
+              onChange={(e) => handleEmailChange(e.target.value)}
+              aria-label="Developer email — scopes logs to your session"
+              className="developer-email-input"
+            />
+          </div>
           <label className="auto-refresh-control">
             <input
               type="checkbox"
@@ -251,8 +278,13 @@ export function ApiDebugDashboard() {
           </div>
 
           {error ? <div className="status-banner failed">{error}</div> : null}
-          {loading ? <div className="empty-state">Loading logs</div> : null}
-          {!loading && logs.length === 0 ? <div className="empty-state">No API logs</div> : null}
+          {!developerEmail.trim() ? (
+            <div className="status-banner configure">
+              Enter your ERP login email above to see your API logs.
+            </div>
+          ) : null}
+          {developerEmail.trim() && loading ? <div className="empty-state">Loading logs</div> : null}
+          {developerEmail.trim() && !loading && logs.length === 0 ? <div className="empty-state">No API logs</div> : null}
 
           {logs.length > 0 ? (
             <div className="table-wrap">
