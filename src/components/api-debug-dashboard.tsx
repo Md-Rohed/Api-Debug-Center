@@ -11,7 +11,7 @@ import {
   Trash2,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { ApiDebugLog, ApiDebugStatusFilter } from "@/lib/types";
 
@@ -20,9 +20,29 @@ type LogsResponse = {
   count: number;
   storage: "redis" | "memory";
   timestamp: string;
+  sessionId: string;
 };
 
 const filters: ApiDebugStatusFilter[] = ["all", "success", "failed"];
+
+const SESSION_STORAGE_KEY = "erp-debug-session-id";
+
+/** Returns a stable session ID for this browser tab.
+ *  A new UUID is generated on the very first visit and persisted in
+ *  localStorage so refreshing the page keeps the same session. */
+function getOrCreateSessionId(): string {
+  try {
+    const existing = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (existing) return existing;
+
+    const fresh = crypto.randomUUID();
+    localStorage.setItem(SESSION_STORAGE_KEY, fresh);
+    return fresh;
+  } catch {
+    // Fallback if localStorage is unavailable (e.g. private browsing quirks)
+    return crypto.randomUUID();
+  }
+}
 
 function formatStatus(log: ApiDebugLog) {
   return log.status === null ? "Network" : String(log.status);
@@ -60,6 +80,12 @@ export function ApiDebugDashboard() {
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [storage, setStorage] = useState<LogsResponse["storage"]>("memory");
 
+  // Stable session ID — created once on mount, never changes during the tab lifetime
+  const sessionIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    sessionIdRef.current = getOrCreateSessionId();
+  }, []);
+
   const selectedLog = logs.find((log) => log.id === selectedLogId) ?? logs[0] ?? null;
 
   const metrics = useMemo(() => {
@@ -79,9 +105,15 @@ export function ApiDebugDashboard() {
   }, [logs]);
 
   const loadLogs = useCallback(async () => {
+    const sessionId = sessionIdRef.current;
+    if (!sessionId) return;
+
     try {
       setError(null);
-      const response = await fetch(`/api/logs?status=${filter}`, { cache: "no-store" });
+      const response = await fetch(
+        `/api/logs?status=${filter}&sessionId=${sessionId}`,
+        { cache: "no-store" },
+      );
 
       if (!response.ok) {
         throw new Error(`Dashboard fetch failed with status ${response.status}`);
@@ -121,7 +153,10 @@ export function ApiDebugDashboard() {
   }, [autoRefresh, loadLogs]);
 
   async function clearLogs() {
-    await fetch("/api/logs", { method: "DELETE" });
+    const sessionId = sessionIdRef.current;
+    if (!sessionId) return;
+
+    await fetch(`/api/logs?sessionId=${sessionId}`, { method: "DELETE" });
     setLogs([]);
     setSelectedLogId(null);
     setLastUpdated(new Date().toISOString());

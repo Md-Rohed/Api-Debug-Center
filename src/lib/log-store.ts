@@ -4,8 +4,11 @@ import type { ApiDebugLog, ApiDebugLogPayload, ApiDebugStatusFilter } from "./ty
 const DEFAULT_MAX_LOGS = 300;
 const LOG_KEY = process.env.DEBUG_CENTER_REDIS_KEY || "erp-api-debug-center:logs";
 
+/** 24 hours — idle session keys are cleaned up automatically */
+const SESSION_TTL_SECONDS = 60 * 60 * 24;
+
 type GlobalLogStore = typeof globalThis & {
-  __erpApiDebugCenterLogs?: ApiDebugLog[];
+  __erpApiDebugCenterLogs?: Map<string, ApiDebugLog[]>;
   __erpApiDebugCenterRedis?: Redis;
 };
 
@@ -14,10 +17,22 @@ function getMaxLogs() {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_LOGS;
 }
 
-function getStore() {
+/** Returns the per-session Redis key. */
+function sessionKey(sessionId: string) {
+  return `${LOG_KEY}:${sessionId}`;
+}
+
+/** In-memory fallback: one Map shared across the process, keyed by sessionId. */
+function getStore(): Map<string, ApiDebugLog[]> {
   const store = globalThis as GlobalLogStore;
-  store.__erpApiDebugCenterLogs ??= [];
+  store.__erpApiDebugCenterLogs ??= new Map<string, ApiDebugLog[]>();
   return store.__erpApiDebugCenterLogs;
+}
+
+function getSessionLogs(sessionId: string): ApiDebugLog[] {
+  const store = getStore();
+  if (!store.has(sessionId)) store.set(sessionId, []);
+  return store.get(sessionId)!;
 }
 
 function getRedisConfig() {
@@ -66,45 +81,56 @@ function filterLogs(logs: ApiDebugLog[], filter: ApiDebugStatusFilter) {
   return logs;
 }
 
-export async function addApiDebugLog(payload: Partial<ApiDebugLogPayload>) {
+export async function addApiDebugLog(
+  payload: Partial<ApiDebugLogPayload>,
+  sessionId: string,
+) {
   const log: ApiDebugLog = {
     id: crypto.randomUUID(),
     ...coerceLogPayload(payload),
   };
   const redis = getRedis();
+  const key = sessionKey(sessionId);
 
   if (redis) {
-    await redis.lpush(LOG_KEY, log);
-    await redis.ltrim(LOG_KEY, 0, getMaxLogs() - 1);
+    await redis.lpush(key, log);
+    await redis.ltrim(key, 0, getMaxLogs() - 1);
+    // Refresh TTL on every write so active sessions never expire mid-use
+    await redis.expire(key, SESSION_TTL_SECONDS);
 
     return log;
   }
 
-  const logs = getStore();
+  const logs = getSessionLogs(sessionId);
   logs.unshift(log);
   logs.splice(getMaxLogs());
 
   return log;
 }
 
-export async function getApiDebugLogs(filter: ApiDebugStatusFilter = "all") {
+export async function getApiDebugLogs(
+  sessionId: string,
+  filter: ApiDebugStatusFilter = "all",
+) {
   const redis = getRedis();
+  const key = sessionKey(sessionId);
 
   if (redis) {
-    const logs = await redis.lrange<ApiDebugLog>(LOG_KEY, 0, getMaxLogs() - 1);
+    const logs = await redis.lrange<ApiDebugLog>(key, 0, getMaxLogs() - 1);
     return filterLogs(logs, filter);
   }
 
-  return filterLogs(getStore(), filter);
+  return filterLogs(getSessionLogs(sessionId), filter);
 }
 
-export async function clearApiDebugLogs() {
+export async function clearApiDebugLogs(sessionId: string) {
   const redis = getRedis();
+  const key = sessionKey(sessionId);
 
   if (redis) {
-    await redis.del(LOG_KEY);
+    await redis.del(key);
     return;
   }
 
-  getStore().splice(0);
+  getStore().delete(sessionId);
 }
