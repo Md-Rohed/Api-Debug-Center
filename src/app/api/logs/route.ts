@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 
 import {
   addApiDebugLog,
+  ApiDebugStorageError,
   clearApiDebugLogs,
   getApiDebugLogs,
   getApiDebugStorageMode,
@@ -43,19 +44,41 @@ function resolveSessionId(request: NextRequest): string {
   return sanitized.length > 0 ? sanitized : SHARED_INGEST_SESSION;
 }
 
+/** Turns a storage failure into a readable response instead of an opaque 500.
+ *  503 tells the dashboard this is transient and worth retrying. */
+function storageErrorResponse(error: unknown) {
+  const message =
+    error instanceof ApiDebugStorageError ? error.message : "Log storage is unavailable";
+
+  console.error("[api/logs] storage failure:", error);
+
+  return Response.json(
+    { error: message, quotaExceeded: error instanceof ApiDebugStorageError && error.quotaExceeded },
+    { status: 503 }
+  );
+}
+
 export async function GET(request: NextRequest) {
   const sessionId = resolveSessionId(request);
   const filter = parseStatusFilter(request.nextUrl.searchParams.get("status"));
-  const logs = await getApiDebugLogs(sessionId, filter);
+  // The dashboard sends the log it currently has open; only that one comes
+  // back with full request/response bodies.
+  const detailId = request.nextUrl.searchParams.get("detailId");
 
-  return Response.json({
-    logs,
-    count: logs.length,
-    maxLogs: Number(process.env.DEBUG_CENTER_MAX_LOGS || 300),
-    storage: getApiDebugStorageMode(),
-    timestamp: new Date().toISOString(),
-    sessionId,
-  });
+  try {
+    const logs = await getApiDebugLogs(sessionId, filter, detailId);
+
+    return Response.json({
+      logs,
+      count: logs.length,
+      maxLogs: Number(process.env.DEBUG_CENTER_MAX_LOGS || 300),
+      storage: getApiDebugStorageMode(),
+      timestamp: new Date().toISOString(),
+      sessionId,
+    });
+  } catch (error) {
+    return storageErrorResponse(error);
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -63,21 +86,35 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  let payload: Partial<ApiDebugLogPayload>;
+
   try {
-    const payload = (await request.json()) as Partial<ApiDebugLogPayload>;
+    payload = (await request.json()) as Partial<ApiDebugLogPayload>;
+  } catch {
+    return Response.json({ error: "Invalid log payload" }, { status: 400 });
+  }
+
+  try {
     // Use the sessionId from the URL (set by ERP api-client via developer email).
     // Falls back to SHARED_INGEST_SESSION when no sessionId is supplied.
     const sessionId = resolveSessionId(request);
     const log = await addApiDebugLog(payload, sessionId);
 
     return Response.json({ ok: true, logId: log.id });
-  } catch {
-    return Response.json({ error: "Invalid log payload" }, { status: 400 });
+  } catch (error) {
+    // A storage outage is not the caller's fault — don't report it as a 400.
+    return storageErrorResponse(error);
   }
 }
 
 export async function DELETE(request: NextRequest) {
   const sessionId = resolveSessionId(request);
-  await clearApiDebugLogs(sessionId);
+
+  try {
+    await clearApiDebugLogs(sessionId);
+  } catch (error) {
+    return storageErrorResponse(error);
+  }
+
   return Response.json({ ok: true, sessionId });
 }

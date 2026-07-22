@@ -14,10 +14,10 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { ApiDebugLog, ApiDebugStatusFilter } from "@/lib/types";
+import type { ApiDebugLogSummary, ApiDebugStatusFilter } from "@/lib/types";
 
 type LogsResponse = {
-  logs: ApiDebugLog[];
+  logs: ApiDebugLogSummary[];
   count: number;
   storage: "redis" | "memory";
   timestamp: string;
@@ -25,6 +25,10 @@ type LogsResponse = {
 };
 
 const filters: ApiDebugStatusFilter[] = ["all", "success", "failed"];
+
+/** Every poll costs one Redis command against the plan's monthly budget, so
+ *  keep it modest. Overridable at build time for local debugging. */
+const REFRESH_INTERVAL_MS = Number(process.env.NEXT_PUBLIC_DEBUG_REFRESH_MS) || 5000;
 
 const SESSION_STORAGE_KEY = "erp-debug-developer-email";
 
@@ -44,7 +48,7 @@ function saveEmail(email: string) {
   }
 }
 
-function formatStatus(log: ApiDebugLog) {
+function formatStatus(log: ApiDebugLogSummary) {
   return log.status === null ? "Network" : String(log.status);
 }
 
@@ -72,8 +76,11 @@ function formatPayload(value: unknown) {
 
 export function ApiDebugDashboard() {
   const [filter, setFilter] = useState<ApiDebugStatusFilter>("all");
-  const [logs, setLogs] = useState<ApiDebugLog[]>([]);
+  const [logs, setLogs] = useState<ApiDebugLogSummary[]>([]);
   const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
+  // Bodies arrive only for the selected log, so hold onto the ones we've been
+  // sent — otherwise re-selecting a log blanks the detail pane until the next poll.
+  const [detailCache, setDetailCache] = useState<Record<string, ApiDebugLogSummary>>({});
   const [loading, setLoading] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -89,7 +96,9 @@ export function ApiDebugDashboard() {
     setDeveloperEmail(readSavedEmail());
   }, []);
 
-  const selectedLog = logs.find((log) => log.id === selectedLogId) ?? logs[0] ?? null;
+  const listedLog = logs.find((log) => log.id === selectedLogId) ?? logs[0] ?? null;
+  // Prefer the cached copy: it's the one that actually carries the bodies.
+  const selectedLog = listedLog ? (detailCache[listedLog.id] ?? listedLog) : null;
 
   const metrics = useMemo(() => {
     const successCount = logs.filter((log) => log.success).length;
@@ -115,14 +124,24 @@ export function ApiDebugDashboard() {
 
     try {
       setError(null);
-      const sessionId = encodeURIComponent(developerEmail.trim());
-      const response = await fetch(
-        `/api/logs?status=${filter}&sessionId=${sessionId}`,
-        { cache: "no-store" },
-      );
+      const params = new URLSearchParams({
+        status: filter,
+        sessionId: developerEmail.trim(),
+      });
+      // Ask for full bodies on the open log only.
+      if (selectedLogId) params.set("detailId", selectedLogId);
+
+      const response = await fetch(`/api/logs?${params}`, { cache: "no-store" });
 
       if (!response.ok) {
-        throw new Error(`Dashboard fetch failed with status ${response.status}`);
+        // The route reports storage problems as a readable message; prefer it
+        // over the bare status code.
+        const detail = await response
+          .json()
+          .then((body) => (body as { error?: string }).error)
+          .catch(() => null);
+
+        throw new Error(detail ?? `Dashboard fetch failed with status ${response.status}`);
       }
 
       const data = (await response.json()) as LogsResponse;
@@ -133,12 +152,21 @@ export function ApiDebugDashboard() {
         if (current && data.logs.some((log) => log.id === current)) return current;
         return data.logs[0]?.id ?? null;
       });
+
+      const expanded = data.logs.filter((log) => !log.truncated);
+      if (expanded.length > 0) {
+        setDetailCache((current) => {
+          const next = { ...current };
+          for (const log of expanded) next[log.id] = log;
+          return next;
+        });
+      }
     } catch (fetchError) {
       setError(fetchError instanceof Error ? fetchError.message : "Unable to load logs");
     } finally {
       setLoading(false);
     }
-  }, [filter, developerEmail]);
+  }, [filter, developerEmail, selectedLogId]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -153,7 +181,7 @@ export function ApiDebugDashboard() {
 
     const interval = window.setInterval(() => {
       void loadLogs();
-    }, 1500);
+    }, REFRESH_INTERVAL_MS);
 
     return () => window.clearInterval(interval);
   }, [autoRefresh, loadLogs]);
@@ -161,10 +189,11 @@ export function ApiDebugDashboard() {
   async function clearLogs() {
     if (!developerEmail.trim()) return;
 
-    const sessionId = encodeURIComponent(developerEmail.trim());
-    await fetch(`/api/logs?sessionId=${sessionId}`, { method: "DELETE" });
+    const params = new URLSearchParams({ sessionId: developerEmail.trim() });
+    await fetch(`/api/logs?${params}`, { method: "DELETE" });
     setLogs([]);
     setSelectedLogId(null);
+    setDetailCache({});
     setLastUpdated(new Date().toISOString());
   }
 
@@ -174,6 +203,7 @@ export function ApiDebugDashboard() {
     // Reset log state so the new session loads cleanly
     setLogs([]);
     setSelectedLogId(null);
+    setDetailCache({});
     setLoading(true);
   }
 
@@ -283,8 +313,12 @@ export function ApiDebugDashboard() {
               Enter your ERP login email above to see your API logs.
             </div>
           ) : null}
-          {developerEmail.trim() && loading ? <div className="empty-state">Loading logs</div> : null}
-          {developerEmail.trim() && !loading && logs.length === 0 ? <div className="empty-state">No API logs</div> : null}
+          {developerEmail.trim() && loading ? (
+            <div className="empty-state">Loading logs</div>
+          ) : null}
+          {developerEmail.trim() && !loading && logs.length === 0 ? (
+            <div className="empty-state">No API logs</div>
+          ) : null}
 
           {logs.length > 0 ? (
             <div className="table-wrap">
