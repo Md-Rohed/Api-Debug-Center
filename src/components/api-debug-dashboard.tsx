@@ -2,8 +2,10 @@
 
 import {
   Activity,
+  Check,
   CheckCircle2,
   Clock3,
+  Copy,
   Pause,
   Play,
   RefreshCw,
@@ -31,6 +33,7 @@ const filters: ApiDebugStatusFilter[] = ["all", "success", "failed"];
 const REFRESH_INTERVAL_MS = Number(process.env.NEXT_PUBLIC_DEBUG_REFRESH_MS) || 5000;
 
 const SESSION_STORAGE_KEY = "erp-debug-developer-email";
+type CopyTarget = "request" | "response";
 
 function readSavedEmail(): string {
   try {
@@ -86,6 +89,11 @@ export function ApiDebugDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [storage, setStorage] = useState<LogsResponse["storage"]>("memory");
+  const [copyStatus, setCopyStatus] = useState<{
+    target: CopyTarget;
+    state: "copied" | "failed";
+  } | null>(null);
+  const copyStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Developer email — used as the per-developer sessionId.
   // Populated from localStorage on first render.
@@ -94,6 +102,25 @@ export function ApiDebugDashboard() {
 
   useEffect(() => {
     setDeveloperEmail(readSavedEmail());
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (copyStatusTimerRef.current) clearTimeout(copyStatusTimerRef.current);
+    },
+    []
+  );
+
+  const copyPayload = useCallback(async (target: CopyTarget, value: unknown) => {
+    try {
+      await navigator.clipboard.writeText(formatPayload(value));
+      setCopyStatus({ target, state: "copied" });
+    } catch {
+      setCopyStatus({ target, state: "failed" });
+    }
+
+    if (copyStatusTimerRef.current) clearTimeout(copyStatusTimerRef.current);
+    copyStatusTimerRef.current = setTimeout(() => setCopyStatus(null), 2000);
   }, []);
 
   const listedLog = logs.find((log) => log.id === selectedLogId) ?? logs[0] ?? null;
@@ -406,12 +433,50 @@ export function ApiDebugDashboard() {
               ) : null}
 
               <section className="payload-section">
-                <h3>Request body</h3>
+                <div className="payload-heading">
+                  <h3>Request body</h3>
+                  <button
+                    className="copy-button"
+                    type="button"
+                    onClick={() => void copyPayload("request", selectedLog.requestBody)}
+                    aria-label="Copy request body"
+                  >
+                    {copyStatus?.target === "request" && copyStatus.state === "copied" ? (
+                      <Check size={14} aria-hidden="true" />
+                    ) : (
+                      <Copy size={14} aria-hidden="true" />
+                    )}
+                    {copyStatus?.target === "request"
+                      ? copyStatus.state === "copied"
+                        ? "Copied"
+                        : "Copy failed"
+                      : "Copy"}
+                  </button>
+                </div>
                 <pre>{formatPayload(selectedLog.requestBody)}</pre>
               </section>
 
               <section className="payload-section">
-                <h3>Response body</h3>
+                <div className="payload-heading">
+                  <h3>Response body</h3>
+                  <button
+                    className="copy-button"
+                    type="button"
+                    onClick={() => void copyPayload("response", selectedLog.responseBody)}
+                    aria-label="Copy response body"
+                  >
+                    {copyStatus?.target === "response" && copyStatus.state === "copied" ? (
+                      <Check size={14} aria-hidden="true" />
+                    ) : (
+                      <Copy size={14} aria-hidden="true" />
+                    )}
+                    {copyStatus?.target === "response"
+                      ? copyStatus.state === "copied"
+                        ? "Copied"
+                        : "Copy failed"
+                      : "Copy"}
+                  </button>
+                </div>
                 <pre>{formatPayload(selectedLog.responseBody)}</pre>
               </section>
             </>
