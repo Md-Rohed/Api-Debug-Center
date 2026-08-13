@@ -7,7 +7,7 @@ import {
   getApiDebugLogs,
   getApiDebugStorageMode,
 } from "@/lib/log-store";
-import type { ApiDebugLogPayload, ApiDebugStatusFilter } from "@/lib/types";
+import type { ApiDebugLogPayload, ApiDebugMethodFilter, ApiDebugStatusFilter } from "@/lib/types";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -30,6 +30,11 @@ function secretMatches(receivedSecret: string | null) {
 
 function parseStatusFilter(value: string | null): ApiDebugStatusFilter {
   if (value === "success" || value === "failed") return value;
+  return "all";
+}
+
+function parseMethodFilter(value: string | null): ApiDebugMethodFilter {
+  if (value === "GET" || value === "POST" || value === "PUT") return value;
   return "all";
 }
 
@@ -61,12 +66,13 @@ function storageErrorResponse(error: unknown) {
 export async function GET(request: NextRequest) {
   const sessionId = resolveSessionId(request);
   const filter = parseStatusFilter(request.nextUrl.searchParams.get("status"));
+  const method = parseMethodFilter(request.nextUrl.searchParams.get("method"));
   // The dashboard sends the log it currently has open; only that one comes
   // back with full request/response bodies.
   const detailId = request.nextUrl.searchParams.get("detailId");
 
   try {
-    const logs = await getApiDebugLogs(sessionId, filter, detailId);
+    const logs = await getApiDebugLogs(sessionId, filter, detailId, method);
 
     return Response.json({
       logs,

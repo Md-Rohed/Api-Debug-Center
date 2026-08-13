@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { ApiDebugLogSummary, ApiDebugStatusFilter } from "@/lib/types";
+import type { ApiDebugLogSummary, ApiDebugMethodFilter, ApiDebugStatusFilter } from "@/lib/types";
 
 type LogsResponse = {
   logs: ApiDebugLogSummary[];
@@ -27,6 +27,7 @@ type LogsResponse = {
 };
 
 const filters: ApiDebugStatusFilter[] = ["all", "success", "failed"];
+const methodFilters: ApiDebugMethodFilter[] = ["all", "GET", "POST", "PUT"];
 
 /** Every poll costs one Redis command against the plan's monthly budget, so
  *  keep it modest. Overridable at build time for local debugging. */
@@ -64,13 +65,6 @@ function formatTimestamp(value: string) {
   }).format(new Date(value));
 }
 
-function formatDateTime(value: string) {
-  return new Intl.DateTimeFormat("en", {
-    dateStyle: "medium",
-    timeStyle: "medium",
-  }).format(new Date(value));
-}
-
 function formatPayload(value: unknown) {
   if (value === undefined || value === null) return "null";
   if (typeof value === "string") return value;
@@ -79,6 +73,7 @@ function formatPayload(value: unknown) {
 
 export function ApiDebugDashboard() {
   const [filter, setFilter] = useState<ApiDebugStatusFilter>("all");
+  const [methodFilter, setMethodFilter] = useState<ApiDebugMethodFilter>("all");
   const [logs, setLogs] = useState<ApiDebugLogSummary[]>([]);
   const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
   // Bodies arrive only for the selected log, so hold onto the ones we've been
@@ -153,6 +148,7 @@ export function ApiDebugDashboard() {
       setError(null);
       const params = new URLSearchParams({
         status: filter,
+        method: methodFilter,
         sessionId: developerEmail.trim(),
       });
       // Ask for full bodies on the open log only.
@@ -193,7 +189,7 @@ export function ApiDebugDashboard() {
     } finally {
       setLoading(false);
     }
-  }, [filter, developerEmail, selectedLogId]);
+  }, [filter, methodFilter, developerEmail, selectedLogId]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -317,17 +313,31 @@ export function ApiDebugDashboard() {
       <section className="workspace-grid">
         <div className="log-list-panel">
           <div className="panel-toolbar">
-            <div className="segmented-control" aria-label="Filter logs">
-              {filters.map((value) => (
-                <button
-                  key={value}
-                  type="button"
-                  className={filter === value ? "active" : ""}
-                  onClick={() => setFilter(value)}
-                >
-                  {value}
-                </button>
-              ))}
+            <div className="filter-controls">
+              <div className="segmented-control" aria-label="Filter logs by status">
+                {filters.map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    className={filter === value ? "active" : ""}
+                    onClick={() => setFilter(value)}
+                  >
+                    {value}
+                  </button>
+                ))}
+              </div>
+              <div className="segmented-control method-filter" aria-label="Filter logs by method">
+                {methodFilters.map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    className={methodFilter === value ? "active" : ""}
+                    onClick={() => setMethodFilter(value)}
+                  >
+                    {value}
+                  </button>
+                ))}
+              </div>
             </div>
             <span className="last-updated">
               {lastUpdated ? `Updated ${formatTimestamp(lastUpdated)}` : "Waiting"}
@@ -399,31 +409,11 @@ export function ApiDebugDashboard() {
                   </span>
                   <h2>{selectedLog.endpoint}</h2>
                 </div>
-                <span className="method-pill">{selectedLog.method}</span>
+                <div className="detail-badges">
+                  <span className="method-pill">{selectedLog.method}</span>
+                  <span className="status-code">{formatStatus(selectedLog)}</span>
+                </div>
               </div>
-
-              <dl className="detail-grid">
-                <div>
-                  <dt>Status</dt>
-                  <dd>{formatStatus(selectedLog)}</dd>
-                </div>
-                <div>
-                  <dt>Duration</dt>
-                  <dd>{selectedLog.durationMs}ms</dd>
-                </div>
-                <div>
-                  <dt>Source</dt>
-                  <dd>{selectedLog.source}</dd>
-                </div>
-                <div>
-                  <dt>Environment</dt>
-                  <dd>{selectedLog.environment}</dd>
-                </div>
-                <div className="wide">
-                  <dt>Timestamp</dt>
-                  <dd>{formatDateTime(selectedLog.timestamp)}</dd>
-                </div>
-              </dl>
 
               {selectedLog.errorMessage ? (
                 <section className="payload-section">

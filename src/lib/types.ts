@@ -1,4 +1,5 @@
 export type ApiDebugStatusFilter = "all" | "success" | "failed";
+export type ApiDebugMethodFilter = "all" | "GET" | "POST" | "PUT";
 
 export type ApiDebugLog = {
   id: string;

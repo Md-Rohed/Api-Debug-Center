@@ -3,6 +3,7 @@ import type {
   ApiDebugLog,
   ApiDebugLogPayload,
   ApiDebugLogSummary,
+  ApiDebugMethodFilter,
   ApiDebugStatusFilter,
 } from "./types";
 
@@ -94,6 +95,11 @@ function filterLogs(logs: ApiDebugLog[], filter: ApiDebugStatusFilter) {
   return logs;
 }
 
+function filterLogsByMethod(logs: ApiDebugLog[], method: ApiDebugMethodFilter) {
+  if (method === "all") return logs;
+  return logs.filter((log) => log.method === method);
+}
+
 /** Drops request/response bodies. These dominate the payload size, and the
  *  dashboard only ever renders the bodies of the single selected log. */
 function toSummary(log: ApiDebugLog): ApiDebugLogSummary {
@@ -176,7 +182,8 @@ export async function addApiDebugLog(payload: Partial<ApiDebugLogPayload>, sessi
 export async function getApiDebugLogs(
   sessionId: string,
   filter: ApiDebugStatusFilter = "all",
-  detailId: string | null = null
+  detailId: string | null = null,
+  method: ApiDebugMethodFilter = "all"
 ): Promise<ApiDebugLogSummary[]> {
   const redis = getRedis();
   const key = sessionKey(sessionId);
@@ -190,10 +197,13 @@ export async function getApiDebugLogs(
       throw new ApiDebugStorageError(error);
     }
 
-    return projectLogs(filterLogs(logs, filter), detailId);
+    return projectLogs(filterLogsByMethod(filterLogs(logs, filter), method), detailId);
   }
 
-  return projectLogs(filterLogs(getSessionLogs(sessionId), filter), detailId);
+  return projectLogs(
+    filterLogsByMethod(filterLogs(getSessionLogs(sessionId), filter), method),
+    detailId
+  );
 }
 
 export async function clearApiDebugLogs(sessionId: string) {
