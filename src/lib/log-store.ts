@@ -1,10 +1,12 @@
-import { Redis } from "@upstash/redis";
+import { Redis as UpstashRedis } from "@upstash/redis";
+import IORedis, { type RedisOptions } from "ioredis";
 import type {
   ApiDebugLog,
   ApiDebugLogPayload,
   ApiDebugLogSummary,
   ApiDebugMethodFilter,
   ApiDebugStatusFilter,
+  ApiDebugStorageMode,
 } from "./types";
 
 const DEFAULT_MAX_LOGS = 300;
@@ -21,9 +23,35 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24;
  *  Reads use LRANGE 0..maxLogs-1, so the overshoot is never visible. */
 const TRIM_SLACK = 50;
 
+/** A self-hosted Redis speaks RESP over a socket, so an unreachable server has
+ *  to fail fast rather than park the dashboard request on ioredis' default
+ *  20-attempt retry ladder. */
+const REDIS_CONNECT_TIMEOUT_MS = 5000;
+const REDIS_MAX_RETRIES_PER_REQUEST = 2;
+
+/** How long the store keeps serving from memory after Redis proves unreachable,
+ *  before it is worth paying the connection cost to try again. */
+const REDIS_RETRY_COOLDOWN_MS = 30_000;
+
+/** The slice of Redis this store actually uses. Keeping it behind one type is
+ *  what lets the self-hosted (RESP) and Upstash (REST) backends stay
+ *  interchangeable for everything below. */
+type LogRedisClient = {
+  lpush(key: string, log: ApiDebugLog): Promise<number>;
+  expire(key: string, seconds: number): Promise<unknown>;
+  trimAndExpire(key: string, stop: number, seconds: number): Promise<unknown>;
+  lrange(key: string, start: number, stop: number): Promise<ApiDebugLog[]>;
+  del(key: string): Promise<unknown>;
+};
+
+type SelfHostedConfig = { kind: "self-hosted"; url?: string; options: RedisOptions };
+type UpstashConfig = { kind: "upstash"; url: string; token: string };
+type RedisConfig = SelfHostedConfig | UpstashConfig;
+
 type GlobalLogStore = typeof globalThis & {
   __erpApiDebugCenterLogs?: Map<string, ApiDebugLog[]>;
-  __erpApiDebugCenterRedis?: Redis;
+  __erpApiDebugCenterRedis?: LogRedisClient;
+  __erpApiDebugCenterRedisDownUntil?: number;
 };
 
 function getMaxLogs() {
@@ -49,27 +77,159 @@ function getSessionLogs(sessionId: string): ApiDebugLog[] {
   return store.get(sessionId)!;
 }
 
-function getRedisConfig() {
-  const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
+/** Reads an env var, treating a blank value as unset. `REDIS_PASSWORD=` on an
+ *  auth-less server has to mean "no password", not "authenticate as empty". */
+function readEnv(name: string) {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}
+
+function getSelfHostedConfig(): SelfHostedConfig | null {
+  const url = readEnv("REDIS_URL");
+  const host = readEnv("REDIS_HOST");
+
+  if (!url && !host) return null;
+
+  const options: RedisOptions = {
+    // Connect on the first command rather than at import time, so a build or a
+    // cold start does not depend on Redis already being up.
+    lazyConnect: true,
+    connectTimeout: REDIS_CONNECT_TIMEOUT_MS,
+    maxRetriesPerRequest: REDIS_MAX_RETRIES_PER_REQUEST,
+  };
+
+  const username = readEnv("REDIS_USERNAME");
+  const password = readEnv("REDIS_PASSWORD");
+  const db = Number(readEnv("REDIS_DB"));
+
+  if (username) options.username = username;
+  if (password) options.password = password;
+  if (Number.isInteger(db) && db >= 0) options.db = db;
+
+  // A URL already carries host/port/auth, so the discrete vars only apply
+  // when no URL was given.
+  if (url) return { kind: "self-hosted", url, options };
+
+  return {
+    kind: "self-hosted",
+    options: { ...options, host, port: Number(readEnv("REDIS_PORT")) || 6379 },
+  };
+}
+
+function getUpstashConfig(): UpstashConfig | null {
+  const url = readEnv("KV_REST_API_URL") ?? readEnv("UPSTASH_REDIS_REST_URL");
+  const token = readEnv("KV_REST_API_TOKEN") ?? readEnv("UPSTASH_REDIS_REST_TOKEN");
 
   if (!url || !token) return null;
 
-  return { url, token };
+  return { kind: "upstash", url, token };
 }
 
-function getRedis() {
+/** A self-hosted server wins when both are configured: it is the one with no
+ *  per-command quota, so leftover Upstash vars never silently take over. */
+function getRedisConfig(): RedisConfig | null {
+  return getSelfHostedConfig() ?? getUpstashConfig();
+}
+
+/** ioredis stores and returns opaque strings, so logs are serialised here.
+ *  An entry that will not parse is dropped rather than allowed to fail the
+ *  whole dashboard fetch. */
+function parseLogs(entries: string[]): ApiDebugLog[] {
+  const logs: ApiDebugLog[] = [];
+
+  for (const entry of entries) {
+    try {
+      logs.push(JSON.parse(entry) as ApiDebugLog);
+    } catch {
+      continue;
+    }
+  }
+
+  return logs;
+}
+
+function createSelfHostedClient(config: SelfHostedConfig): LogRedisClient {
+  const redis = config.url ? new IORedis(config.url, config.options) : new IORedis(config.options);
+
+  // ioredis emits 'error' on every failed connection attempt. With no listener
+  // attached, Node treats that as an unhandled 'error' event and exits.
+  let lastError: string | null = null;
+
+  redis.on("error", (error: Error) => {
+    // Reconnection is retried forever in the background, so report each
+    // distinct failure once rather than once every couple of seconds.
+    if (error.message === lastError) return;
+
+    lastError = error.message;
+    console.error("[log-store] redis connection error:", error.message);
+  });
+
+  redis.on("ready", () => {
+    lastError = null;
+  });
+
+  return {
+    lpush: (key, log) => redis.lpush(key, JSON.stringify(log)),
+    expire: (key, seconds) => redis.expire(key, seconds),
+    trimAndExpire: (key, stop, seconds) =>
+      redis.pipeline().ltrim(key, 0, stop).expire(key, seconds).exec(),
+    lrange: async (key, start, stop) => parseLogs(await redis.lrange(key, start, stop)),
+    del: (key) => redis.del(key),
+  };
+}
+
+function createUpstashClient(config: UpstashConfig): LogRedisClient {
+  const redis = new UpstashRedis({ url: config.url, token: config.token });
+
+  return {
+    lpush: (key, log) => redis.lpush(key, log),
+    expire: (key, seconds) => redis.expire(key, seconds),
+    trimAndExpire: (key, stop, seconds) =>
+      redis.pipeline().ltrim(key, 0, stop).expire(key, seconds).exec(),
+    lrange: (key, start, stop) => redis.lrange<ApiDebugLog>(key, start, stop),
+    del: (key) => redis.del(key),
+  };
+}
+
+/** True while a connection failure has Redis benched. Running the dashboard
+ *  against a machine with no Redis — the ordinary local setup — should not need
+ *  an env change, so the store degrades to memory rather than failing requests. */
+function isRedisDegraded() {
+  const store = globalThis as GlobalLogStore;
+  return (store.__erpApiDebugCenterRedisDownUntil ?? 0) > Date.now();
+}
+
+function benchRedis(error: ApiDebugStorageError) {
+  const store = globalThis as GlobalLogStore;
+  store.__erpApiDebugCenterRedisDownUntil = Date.now() + REDIS_RETRY_COOLDOWN_MS;
+
+  // Reachable at most once per cooldown — isRedisDegraded() short-circuits
+  // every request in between — so this cannot flood the log.
+  console.warn(`[log-store] ${error.message} — serving logs from memory for now`);
+}
+
+function unbenchRedis() {
+  const store = globalThis as GlobalLogStore;
+  if (!store.__erpApiDebugCenterRedisDownUntil) return;
+
+  store.__erpApiDebugCenterRedisDownUntil = 0;
+  console.info("[log-store] redis is reachable again — resuming shared storage");
+}
+
+function getRedis(): LogRedisClient | null {
   const config = getRedisConfig();
-  if (!config) return null;
+  if (!config || isRedisDegraded()) return null;
 
   const store = globalThis as GlobalLogStore;
-  store.__erpApiDebugCenterRedis ??= new Redis(config);
+  store.__erpApiDebugCenterRedis ??=
+    config.kind === "self-hosted" ? createSelfHostedClient(config) : createUpstashClient(config);
 
   return store.__erpApiDebugCenterRedis;
 }
 
-export function getApiDebugStorageMode() {
-  return getRedisConfig() ? "redis" : "memory";
+export function getApiDebugStorageMode(): ApiDebugStorageMode {
+  if (!getRedisConfig()) return "memory";
+  return isRedisDegraded() ? "memory-fallback" : "redis";
 }
 
 function coerceLogPayload(payload: Partial<ApiDebugLogPayload>): ApiDebugLogPayload {
@@ -116,24 +276,64 @@ function projectLogs(logs: ApiDebugLog[], detailId: string | null): ApiDebugLogS
   return logs.map((log) => (log.id === expandedId ? log : toSummary(log)));
 }
 
-/** Upstash returns HTTP 429 once the plan's monthly command or bandwidth
- *  budget is spent. That surfaces here as an opaque throw, so label it. */
+/** A managed plan answers HTTP 429 once its monthly command or bandwidth budget
+ *  is spent. Written narrowly so it does not also swallow ioredis' "Reached the
+ *  max retries per request limit", which means a dead connection, not a quota. */
+const QUOTA_PATTERN =
+  /\b429\b|too many requests|quota|max\s+\w*\s*(?:requests?|commands?|bandwidth)\s+limit/i;
+
+/** A socket-level failure: Redis is down, or the host/port is wrong. */
+const UNREACHABLE_PATTERN =
+  /ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENOTFOUND|EPIPE|connection is closed|max retries per request/i;
+
+/** Storage failures reach the route as opaque throws, so label the two that
+ *  have a specific fix: an exhausted managed quota, and an unreachable server. */
 export class ApiDebugStorageError extends Error {
   readonly quotaExceeded: boolean;
+  readonly unreachable: boolean;
 
   constructor(cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
-    const quotaExceeded = /429|too many requests|quota|exceeded|limit/i.test(detail);
+    const quotaExceeded = QUOTA_PATTERN.test(detail);
+    const unreachable = !quotaExceeded && UNREACHABLE_PATTERN.test(detail);
 
     super(
       quotaExceeded
-        ? `Redis rejected the request — the Upstash plan's command or bandwidth quota looks exhausted (${detail})`
-        : `Redis request failed (${detail})`
+        ? `Redis rejected the request — the managed plan's command or bandwidth quota looks exhausted (${detail})`
+        : unreachable
+          ? `Redis is unreachable — check the server is running and REDIS_URL / REDIS_HOST point at it (${detail})`
+          : `Redis request failed (${detail})`
     );
 
     this.name = "ApiDebugStorageError";
     this.quotaExceeded = quotaExceeded;
+    this.unreachable = unreachable;
     this.cause = cause;
+  }
+}
+
+/** Runs a Redis operation, quietly falling back to the in-memory store when the
+ *  server is unreachable — that is just "no Redis on this machine", which the
+ *  dashboard can serve on its own. Every other failure (bad auth, OOM, an
+ *  exhausted managed quota) still throws: those need fixing, not papering over. */
+async function withRedis<T>(
+  run: (redis: LogRedisClient) => Promise<T>,
+  fallback: () => T
+): Promise<T> {
+  const redis = getRedis();
+  if (!redis) return fallback();
+
+  try {
+    const result = await run(redis);
+    unbenchRedis();
+
+    return result;
+  } catch (cause) {
+    const error = new ApiDebugStorageError(cause);
+    if (!error.unreachable) throw error;
+
+    benchRedis(error);
+    return fallback();
   }
 }
 
@@ -142,11 +342,10 @@ export async function addApiDebugLog(payload: Partial<ApiDebugLogPayload>, sessi
     id: crypto.randomUUID(),
     ...coerceLogPayload(payload),
   };
-  const redis = getRedis();
   const key = sessionKey(sessionId);
 
-  if (redis) {
-    try {
+  return withRedis(
+    async (redis) => {
       // LPUSH returns the new length, which tells us whether any follow-up
       // maintenance is due without spending a command to ask.
       const length = await redis.lpush(key, log);
@@ -159,24 +358,19 @@ export async function addApiDebugLog(payload: Partial<ApiDebugLogPayload>, sessi
         // Keyed off every TRIM_SLACK-th write rather than only on overflow, so
         // a low-traffic session still refreshes its TTL and never expires
         // mid-use. LTRIM below the cap is a harmless no-op.
-        await redis
-          .pipeline()
-          .ltrim(key, 0, getMaxLogs() - 1)
-          .expire(key, SESSION_TTL_SECONDS)
-          .exec();
+        await redis.trimAndExpire(key, getMaxLogs() - 1, SESSION_TTL_SECONDS);
       }
-    } catch (error) {
-      throw new ApiDebugStorageError(error);
+
+      return log;
+    },
+    () => {
+      const logs = getSessionLogs(sessionId);
+      logs.unshift(log);
+      logs.splice(getMaxLogs());
+
+      return log;
     }
-
-    return log;
-  }
-
-  const logs = getSessionLogs(sessionId);
-  logs.unshift(log);
-  logs.splice(getMaxLogs());
-
-  return log;
+  );
 }
 
 export async function getApiDebugLogs(
@@ -185,40 +379,21 @@ export async function getApiDebugLogs(
   detailId: string | null = null,
   method: ApiDebugMethodFilter = "all"
 ): Promise<ApiDebugLogSummary[]> {
-  const redis = getRedis();
   const key = sessionKey(sessionId);
 
-  if (redis) {
-    let logs: ApiDebugLog[];
-
-    try {
-      logs = await redis.lrange<ApiDebugLog>(key, 0, getMaxLogs() - 1);
-    } catch (error) {
-      throw new ApiDebugStorageError(error);
-    }
-
-    return projectLogs(filterLogsByMethod(filterLogs(logs, filter), method), detailId);
-  }
-
-  return projectLogs(
-    filterLogsByMethod(filterLogs(getSessionLogs(sessionId), filter), method),
-    detailId
+  const logs = await withRedis(
+    (redis) => redis.lrange(key, 0, getMaxLogs() - 1),
+    () => getSessionLogs(sessionId)
   );
+
+  return projectLogs(filterLogsByMethod(filterLogs(logs, filter), method), detailId);
 }
 
 export async function clearApiDebugLogs(sessionId: string) {
-  const redis = getRedis();
   const key = sessionKey(sessionId);
 
-  if (redis) {
-    try {
-      await redis.del(key);
-    } catch (error) {
-      throw new ApiDebugStorageError(error);
-    }
-
-    return;
-  }
-
-  getStore().delete(sessionId);
+  await withRedis(
+    (redis) => redis.del(key),
+    () => getStore().delete(sessionId)
+  );
 }

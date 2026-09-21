@@ -16,14 +16,27 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { ApiDebugLogSummary, ApiDebugMethodFilter, ApiDebugStatusFilter } from "@/lib/types";
+import type {
+  ApiDebugLogSummary,
+  ApiDebugMethodFilter,
+  ApiDebugStatusFilter,
+  ApiDebugStorageMode,
+} from "@/lib/types";
 
 type LogsResponse = {
   logs: ApiDebugLogSummary[];
   count: number;
-  storage: "redis" | "memory";
+  storage: ApiDebugStorageMode;
   timestamp: string;
   sessionId: string;
+};
+
+/** `memory-fallback` is worth spelling out: logs are alive but process-local,
+ *  so a teammate on another instance will not see them. */
+const storageLabels: Record<ApiDebugStorageMode, string> = {
+  redis: "redis",
+  memory: "in-memory",
+  "memory-fallback": "in-memory (redis unreachable)",
 };
 
 const filters: ApiDebugStatusFilter[] = ["all", "success", "failed"];
@@ -236,7 +249,7 @@ export function ApiDebugDashboard() {
         <div>
           <div className="debug-kicker">
             <Server size={16} aria-hidden="true" />
-            Petra ERP QA · {storage}
+            Petra ERP QA · {storageLabels[storage]}
           </div>
           <h1>ERP API Debug Center</h1>
         </div>

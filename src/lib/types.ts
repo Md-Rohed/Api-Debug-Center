@@ -1,6 +1,10 @@
 export type ApiDebugStatusFilter = "all" | "success" | "failed";
 export type ApiDebugMethodFilter = "all" | "GET" | "POST" | "PUT";
 
+/** Where logs are currently being kept. `memory-fallback` is the degraded case:
+ *  Redis is configured but unreachable, so logs are per-process and unshared. */
+export type ApiDebugStorageMode = "redis" | "memory" | "memory-fallback";
+
 export type ApiDebugLog = {
   id: string;
   timestamp: string;
